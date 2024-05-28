@@ -263,8 +263,8 @@ compute_flux <- function(j) {
   Flux$CH4oxid  <- P$V4 * P$beta3
   Flux$Photo    <- P$V5 * P$beta4
   #
-  Flux$CO2out   <- P$V1 * P$depth * 12                                              # unit g C-CO2 / m2 /day
-  Flux$CH4out   <- (P$beta2 - P$beta3) * 12 * 1000  # unit mg C-CH4 / m2 /day 32-50-150 or more
+  Flux$CO2out   <- P$V1 * P$depth * 12                          # unit g C-CO2 / m2 /day
+  Flux$CH4out   <- (P$beta2 - P$beta3) * 12 * 1000              # unit mg C-CH4 / m2 /day 
   Flux$GPP      <- P$beta4 * sqrt(P$Chla) * P$depth * 12        # unit g C-CO2 / m2 /day  1~2
   Flux$fCH4oxid <- P$beta3 / P$beta2                                                # unitless
   #  Flux
