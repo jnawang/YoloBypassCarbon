@@ -1,0 +1,295 @@
+---
+title: "Yolo_chemistry"
+author: "Junna"
+date: "5/1/2024"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r create a function to calculate coefficient before variables}
+library(lubridate)
+library(tidyverse)
+rm(list = ls())
+  # 
+  # data will be used by every dataset
+  pCO2     = 419 * 0.1^6          # 419 ppm in air
+  d13C.CO2 = - 8.5                # -8.4 ‰ in air in 2015; Ref: Changes to Carbon Isotopes in Atmospheric CO2 Over the Industrial Era and Into the Future
+  R.CO2    = d13C.CO2*0.001 + 1.0
+  #
+  # a function to calculate terms in equations
+pre.carbon <- function(Tc, pH, DIC, d13C.DIC, TOC, d13C.TOC, Chla, d13C.photo, depth) {
+  #
+  carbon.matrix <- matrix(0, nrow = 2, ncol = 5)
+  #
+  Tk = Tc + 273.15
+  K1 = - 356.3094 - 0.06091964*Tk + 21834.37/Tk + 126.8339 * log10(Tk) - 1684915 / Tk^2
+  K2 = - 107.8871 - 0.03252849*Tk + 5151.79/Tk  + 38.92561 * log10(Tk) - 563713.9 / Tk^2
+  # exp transform
+  K1 = 10^K1
+  K2 = 10^K2
+  
+  #
+  H.ion   = 10^(-pH)
+  f.H2CO3 = H.ion / K1             # fraction of aqueous CO2 compared to HCO3
+  f.CO3   = K2 / H.ion
+  
+  # DIC species
+  HCO3  = DIC / (1.0 + f.H2CO3 + f.CO3)
+  H2CO3 = HCO3 * f.H2CO3
+  CO3   = HCO3 * f.CO3
+  
+  # calculate d13C of each species
+  # follow the method from "Multiple sources and sinks of dissolved inorganic carbon across Swedish streams"
+  eps.bg = -0.1141 * Tc + 10.78   # ‰
+  eps.dg =  0.0049 * Tc - 1.31    # ‰
+  eps.cg = -0.052 * Tc + 7.22     # ‰, equation is from Zhang's paper. 
+  #
+  eps.db = eps.dg - eps.bg
+  eps.cb = (eps.cg - eps.bg) / (1.0 + eps.db * 0.001)         # not sure why we divide this part.
+  #
+  d13C.HCO3  = (d13C.DIC * DIC - eps.db * H2CO3 - eps.cb * CO3) / (H2CO3 * (1.0+eps.db*0.001) + HCO3 + CO3 * (1.0+eps.cb*0.001))
+  d13C.H2CO3 = d13C.HCO3 * (1.0+eps.db*0.001) + eps.db
+  d13C.CO3   = d13C.HCO3 * (1.0+eps.cb*0.001) + eps.cb
+  
+  # it may be better to change this delta into ratios
+  R.HCO3  = d13C.HCO3*0.001 + 1.0
+  R.H2CO3 = d13C.H2CO3*0.001 + 1.0
+  R.CO3   = d13C.CO3*0.001 + 1.0
+  R.dg    = eps.dg*0.001 + 1.0
+  
+  #
+  KH <- 2385.73 / Tk + 0.0152642 * Tk - 14.0184       # this value is higher than standard value. Mook et al. 1974 (mol/L/atm)
+  KH <- KH - 0.00147*(0.28596 - 0.0006167*Tk)
+  KH <- 10^KH
+  KL <- (0.052024 * Tc + 0.69145) * 0.1^5 * 8.64 / 0.00035  # diffusion coefficient (1.9 * 10^(-5) cm2/s at 25C), then divided by stagnant film thickness = 350 um (270-800 um) to get gas transfer velocity; 
+  DIC_exchange <- (KH * pCO2 * 1000 - H2CO3) * KL / depth
+  # eps.k = -0.81 ‰ at 21C and -0.95 at 5C; so in our study we use -0.9
+  C13_exchange <- ((KH * pCO2 * R.CO2 * R.dg * 1000  - H2CO3 * R.H2CO3) * (-0.9 /1000 + 1.0) * KL / depth - DIC_exchange) * 1000
+  #
+  carbon.matrix[1,1] <- - DIC_exchange
+  carbon.matrix[2,1] <- - C13_exchange
+  carbon.matrix[1,2] <- TOC
+  carbon.matrix[2,2] <- TOC * d13C.TOC
+  #
+  # Methanogenesis
+  carbon.matrix[1,3] <- 1.0 / depth
+  carbon.matrix[2,3] <- 16 / depth     # 16 = -26 * 2 + 68: d13C of CO2 by methanogenesis
+  #
+  # CH4 oxidation
+  carbon.matrix[1,4] <- 1.0 / depth                                                # coefficient before this one is fraction * rates
+  carbon.matrix[2,4] <- (-68.87 - 8.322) / depth    # 68:  d13C of CH4 by methanogenesis
+  #
+  # photosynthesis
+  carbon.matrix[1,5] <- - sqrt(Chla)
+  carbon.matrix[2,5] <- - sqrt(Chla) * d13C.photo
+  return(carbon.matrix)
+}
+
+
+data <- read.csv('DIC_data.csv')
+data$date  <- ymd(data$date)
+data$year  <- year(data$date)
+data$month <- month(data$date)
+data$TOC   <- data$DOC + data$POC
+data$d13C.TOC <- (data$DOC * data$d13C.DOC + data$POC * data$d13C.POC) / data$TOC
+
+d <- data
+# prepare for the matrix
+for (i in 1:nrow(d)) {
+  Pi <- pre.carbon(Tc = d$Tc[i], pH = d$Ph[i], DIC = d$DIC[i], d13C.DIC = d$d13C.DIC[i], TOC = d$TOC[i]/12.0, d13C.TOC = d$d13C.TOC[i], Chla = d$Chla[i], d13C.photo = d$d13C.photo[i], depth = d$depth[i])
+  if (i==1) {
+    P <- Pi
+  } else {
+    P <- rbind(P, Pi)
+  }
+}
+d <- as.data.frame(P)
+#
+# Add a fifth column: dDICdt
+d$dDICdt <- 0
+# Calculate this for every site and every sampling
+# a data frame records average value
+data.DIC <- data %>% group_by(date, site) %>% summarise_at(vars(DIC, d13C.DIC), mean)
+for (i in 1:nrow(data)) {
+  subdata <- data.DIC %>% filter(site == data$site[i] & date != data$date[i])
+  if (nrow(subdata) > 0) {
+    id.nb  <- which.min(abs(subdata$date - data$date[i]))
+    d$dDICdt[2*i-1] <- (subdata$DIC[id.nb] - data$DIC[i]) / as.double(difftime(subdata$date[id.nb], data$date[i]))
+    d$dDICdt[2*i]   <- (subdata$DIC[id.nb] * subdata$d13C.DIC[id.nb] - data$DIC[i] * data$d13C.DIC[i]) / as.double(difftime(subdata$date[id.nb], data$date[i]))
+  }
+}
+
+d <- cbind(d, as.data.frame(lapply(data, rep, each = 2)))
+
+```
+
+
+```{r DIC and DI13C mass balance models}
+P <- d
+
+# I have to do something make C12 and C13 equations are relatively equivalent!
+amplifier <- (abs(mean(P$V1[seq(2,nrow(P),2)] + P$dDICdt[seq(2,nrow(P),2)]) / mean(P$V1[seq(1,nrow(P),2)] + P$dDICdt[seq(1,nrow(P),2)])) + 0.1)
+P[seq(1,nrow(P),2), 1:6] <- P[seq(1,nrow(P),2), 1:6] * amplifier
+
+# Add one column indicating group name
+# P$group = paste0(P$site, '_m', P$month)
+P$group = paste0(P$site, '_', P$date)
+
+# put data from different months into different columns
+# number of months, add new columns, and put unused cells to zero.
+group   = unique(P$group)
+n.group = length(group)
+n.col   = ncol(P)
+for (i in 1:n.group) {
+  P[, (n.col+2*i-1):(n.col+2*i)] <- 0
+  P[P$group==group[i], (n.col+2*i-1):(n.col+2*i)] <- P[P$group==group[i], 3:4]
+  colnames(P)[(n.col+2*i-1):(n.col+2*i)] <- c(paste0('V3_',i), paste0('V4_',i))
+}
+
+# fit for ktoc for each month
+month   = unique(P$month)
+n.month = length(month)
+n.col.month   = ncol(P)
+for (i in 1:n.month) {
+  P[, (n.col.month+i)] <- 0
+  P[P$month==month[i], (n.col.month+i)] <- P[P$month==month[i], 2]
+  colnames(P)[(n.col.month+i)] <- c(paste0('V2_',i))
+}
+
+#
+# try rstan
+library(rstan)
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+#
+nobsv = nrow(P)
+dat <- list(N = nobsv,
+            K = n.group,
+            x_pt = as.matrix(P[, 5]),         # I have to use as.matrix to convert vector to matrix
+            x_mt = P[, seq((n.col+1), (n.col+2*n.group), 2)],
+            x_ox = P[, seq((n.col+2), (n.col+2*n.group), 2)],
+            x_mn = P[, (n.col.month+1):(n.col.month+n.month)],
+            y = as.vector(P$V1 + P$dDICdt))
+dat$N_new <- dat$N
+dat$x_pt_new <- dat$x_pt
+dat$x_mn_new <- dat$x_mn
+dat$x_mt_new <- dat$x_mt
+dat$x_ox_new <- dat$x_ox
+#
+#
+multiple_Regression_Code <- '
+data {
+  int<lower=0> N;  // number of data items
+  int<lower=0> K;  // number of predictors, sites
+  matrix[N, 1] x_pt;  // predictor matrix
+  matrix[N, 3] x_mn;  // predictor matrix
+  matrix[N, K] x_mt;  // predictor matrix
+  matrix[N, K] x_ox;  // predictor matrix 
+  vector[N] y;     // outcome vector
+  //
+  int<lower=0> N_new;
+  matrix[N_new, 1] x_pt_new;  // predictor matrix
+  matrix[N_new, 3] x_mn_new;  // predictor matrix
+  matrix[N_new, K] x_mt_new;  // predictor matrix
+  matrix[N_new, K] x_ox_new;  // predictor matrix
+}
+parameters {
+  vector<lower=0>[3] beta_mn;                 // coefficients for mineralization
+  vector<lower=0>[K] beta_mt;                 // coefficients for methonagenesis
+  vector<lower=0, upper=1>[K] beta_ox;        // coefficients for oxidation
+  vector<lower=0.04, upper=0.06>[1] beta_pt;   // photosynthesis
+  real<lower=0> sigma;                        // error scale
+}
+model {
+  y ~ normal(x_pt * beta_pt + x_mn * beta_mn + x_mt * beta_mt + x_ox * (beta_ox .* beta_mt), sigma) ;     //    //it is super important to make the type of variables consistent. 
+  beta_mn ~ exponential(1);
+  beta_mt ~ exponential(1);
+  beta_ox ~ uniform(0, 1);                 // I can also use exponential for this one; uniform(0, 1)
+  beta_pt ~ normal(0.05, 0.1);
+  sigma ~ exponential(1);
+}
+generated quantities {
+  vector[N_new] y_new;
+  //
+  for (n in 1:N_new) 
+    y_new[n] = normal_rng(x_pt_new[n] * beta_pt + x_mn_new[n] * beta_mn + x_mt_new[n] * beta_mt + x_ox_new[n] * (beta_ox .* beta_mt), sigma);   //
+}
+'
+#
+fit <- stan(model_code = multiple_Regression_Code, data = dat, iter = 3000, chains = 4, control=list(adapt_delta=0.99, stepsize=0.001, max_treedepth = 15))
+print("Done with the fit!")
+print(fit, probs = c(0.025, 0.05, 0.5, 0.95, 0.975), digits = 5)
+plot(fit, ci_level = 0.9, outer_level = 0.95)
+
+post <- rstan::extract(fit, permuted = TRUE)
+
+mu <- post$y_new
+mu.mean <- apply(mu, 2, mean)
+mu.PI <- apply(mu, 2, function(x) quantile(x, probs = c(0.025, 0.975)))
+
+# observation vs prediction
+cor.test(mu.mean, dat$y, method = "pearson")
+
+plot(mu.mean ~ dat$y, col="blue" , ylim=range(mu.PI) ,
+     xlab="Observed" , ylab="Predicted")
+abline(a=0, b=1, lty = 2)
+for (i in 1:nobsv) lines(rep(dat$y[i],2), mu.PI[,i], col="blue")
+# finish model fitting. 
+
+# remove the amplifier to the odd rows of P
+P[seq(1,nrow(P),2),1:6]  <- P[seq(1,nrow(P),2),1:6] / amplifier
+
+# output result
+compute_flux <- function(j) {
+  for (i in 1:n.group) {
+    P$beta2[P$group==group[i]] <- post$beta_mt[j,i]
+    P$beta3[P$group==group[i]] <- post$beta_ox[j,i] * post$beta_mt[j,i]
+  }
+  for (i in 1:n.month) {
+    P$beta1[P$month==month[i]] <- post$beta_mn[j,i]
+  }
+  P$beta4 <- post$beta_pt[j,1]
+  
+  # start to calculate flux; all results have to have credible level. 
+  # the V1 column represents air-water CO2 exchange.
+  Flux          <- P[, c('group', 'V1', 'dDICdt')]
+  colnames(Flux)[2] <- 'Exchange'
+  Flux$POC      <- P$V2 * P$beta1
+  Flux$Methano  <- P$V3 * P$beta2
+  Flux$CH4oxid  <- P$V4 * P$beta3
+  Flux$Photo    <- P$V5 * P$beta4
+  #
+  Flux$CO2out   <- P$V1 * P$depth * 12                                              # unit g C-CO2 / m2 /day
+  Flux$CH4out   <- (P$beta2 - P$beta3) * 12 * 1000  # unit mg C-CH4 / m2 /day 32-50-150 or more
+  Flux$GPP      <- P$beta4 * sqrt(P$Chla) * P$depth * 12        # unit g C-CO2 / m2 /day  1~2
+  Flux$fCH4oxid <- P$beta3 / P$beta2                                                # unitless
+  #  Flux
+  # get mean values of different months
+  result <- Flux[seq(1,nrow(Flux),2),] %>% group_by(group) %>% summarise_all(mean)   
+  #
+  # sources and sinks of C13
+#  result <- Flux[seq(2,nrow(Flux),2),] %>% group_by(group) %>% summarise_all(mean)  
+
+  return(result)
+}
+
+result <- lapply(1:4000, compute_flux)
+#
+result <- do.call(rbind.data.frame, result)
+
+# How to revise this into mean and percentile?
+result_avg  <- result %>% group_by(group) %>% summarise_all(list(avg = quantile), probs = 0.5)      # quantile, probs = 0.5, list(name = mean)
+result_up   <- result %>% group_by(group) %>% summarise_all(list(up = quantile), probs = 0.975)     # quantile, probs = 0.5, list(name = mean)
+result_dn   <- result %>% group_by(group) %>% summarise_all(list(dn = quantile), probs = 0.025)     # quantile, probs = 0.5, list(name = mean)
+result  <- result_avg %>% left_join(result_up, by = 'group') %>% left_join(result_dn, by = 'group')  
+write.table(result, "clipboard", sep="\t", row.names=FALSE, col.names=TRUE)
+result
+result_up
+result_dn
+
+
+```
