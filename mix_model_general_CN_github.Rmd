@@ -1,0 +1,251 @@
+---
+title: "mix_model_yolobypass"
+author: "Junna"
+date: "5/01/2024"
+output: pdf_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r some preparations}
+library(lubridate)
+library(tidyverse)
+library(rstan)
+rm(list=ls())
+
+# options(mc.cores = parallel::detectCores())
+# rstan_options(auto_write = TRUE)
+
+loc <- '/Users/junnawang/Downloads/'
+setwd(loc)
+
+data_o <- read.csv(file = "input_wet3_202203.csv")
+
+for (i in 1:nrow(data_o)) {
+  if(is.na(as.numeric(data_o$C[i]))) {
+    i = i - 1
+    break
+  }
+}
+
+# here, site means species
+nConsumer <- nrow(data_o) - i
+name_consumer <- data_o[(i+1):(i+nConsumer),1]
+data_iso <- data_o[1:i, 1:3]
+data_iso$Source <- as.factor(data_iso$Source)
+data_iso$C <- as.numeric(data_iso$C)
+data_iso$N <- as.numeric(data_iso$N)
+
+
+# create a new data set 
+data_tp <- list()
+for (i in 1:nConsumer) {
+  C_list <- list('Algae'=data_iso$C[data_iso$Source=='Algae'], 'C3_plants'=data_iso$C[data_iso$Source=='C3_plants'], 'C4_plants'=data_iso$C[data_iso$Source=='C4_plants'])
+  N_list <- list('Algae'=data_iso$N[data_iso$Source=='Algae'], 'C3_plants'=data_iso$N[data_iso$Source=='C3_plants'], 'C4_plants'=data_iso$N[data_iso$Source=='C4_plants'])
+#
+  C_list[[4]] <- data_iso$C[data_iso$Source==name_consumer[i]]
+  N_list[[4]] <- data_iso$N[data_iso$Source==name_consumer[i]]
+  names(C_list)[4] <- name_consumer[i]
+  names(N_list)[4] <- names(C_list)[4]
+#
+  C_list <- cross_df(C_list)
+  C_list$Isotope  <- 'C'
+  C_list$ds <- 0.0                             # the default enrichment for 13C
+#
+  N_list <- cross_df(N_list)
+  N_list$Isotope  <- 'N'
+  N_list$ds <- 2.52                            # the default enrichment for 15N
+  data_tp[[i]] <- rbind(C_list, N_list)
+}
+names(data_tp) <- name_consumer
+
+  
+  # graph isotope niche
+  iso_graph <- ggplot(data=data_iso, aes(x=C, y=N, colour=Source, shape=Source)) +
+    scale_shape_manual(values=1:nlevels(data_iso$Source)) +
+    geom_point()
+  #
+  print(iso_graph)
+
+
+```
+
+
+```{r calculate trophic position of each species, fig.width=5, fig.height=3}
+if (!require(gtools)) install.packages("gtools")
+#
+library(gtools)
+library(caret)
+# this code is used in "Limnology & Oceangraphy" paper
+# Basal resources are algae, C3_plant, and C4_plant
+#
+# define the output dataframe
+res.basalfood <- data.frame(organism = character(), food = character(), avg = double(), p025 = double(), p975=double())
+
+# use d15N of POM as a baseline
+d15N_base <- mean(data_iso$N[data_iso$Source=='POM'])
+
+num = 0
+for (i in 1:nConsumer) {
+  # only look for basal resources of 'Daphniidae', 'Daphnia', copepoda, copepoda
+  if (!names(data_tp)[i] %in% c('Daphniidae', 'Daphnia', 'Copepoda', 'Copepod')) {
+    next
+  }
+  num=num+1
+  # for regressing intercept
+  data_tp[[i]]$ds[data_tp[[i]]$Isotope=='C'] <- 0
+  data_tp[[i]]$ds[data_tp[[i]]$Isotope=='N'] <- 2.52
+  
+  # set trophic level prior for each species
+  # mean value of the trophic level prior
+  tp.prior.mean = (mean(data_iso$N[data_iso$Source==names(data_tp)[i]]) - d15N_base) / 2.52
+  # sigma value of the trophic level prior
+  tp.prior.sigma = 0.1
+  #
+  if (names(data_tp)[i] %in% c('Daphniidae', 'Daphnia')) {
+    tp.upper = 1.0
+  }  else if (names(data_tp)[i] %in% c('Copepoda', 'Copepod')) {
+    tp.upper = 1.5
+  }
+
+  # prepare for input data
+  nobsv = nrow(data_tp[[i]])
+  nvar  = 3
+  dat <- list(N = nobsv,
+              K = nvar,
+              tp_prior_mean = tp.prior.mean,
+              tp_prior_sigma = tp.prior.sigma,
+              tp_upper = tp.upper,
+              x = as.matrix(data_tp[[i]][,1:nvar]),
+              y = as.vector(as.matrix(data_tp[[i]][,(nvar+1)])),
+              d = as.vector(data_tp[[i]]$ds),
+              a = rep(2,nvar))
+  dat$N_new <- dat$N
+  dat$x_new <- dat$x
+  
+  
+  mix_model_Code <- '
+data {
+  int<lower=0> N;  // number of data items
+  int<lower=0> K;  // number of predictors
+  real  tp_prior_mean;    // mean of prior of trophic position
+  real<lower=0> tp_prior_sigma;   // sigma of prior of trophic position
+  real<lower=0> tp_upper;         // the upper limit of Tp
+  matrix[N, K] x;  // predictor matrix
+  vector[N] y;     // outcome vector
+  vector[N] d;     // trophic enrichment
+  //
+  vector[K] a;     // initiation for dirichlet prior
+  //
+  int<lower=0> N_new;
+  matrix[N_new, K] x_new;
+}
+parameters {
+  simplex[K] w;          // ratio of each food resource
+  real<lower=0, upper=tp_upper> tp;    // trophic position # 
+  real<lower=0> sigma_C; // error scale
+  real<lower=0> sigma_N; // error scale
+}
+model {
+  vector[N] mu;
+  //
+  mu = x * w + d*tp;
+  //
+  y[1:(N/2)]   ~ normal(mu[1:(N/2)], sigma_C);    // likelihood for dC
+  y[(N/2+1):N] ~ normal(mu[(N/2+1):N], sigma_N);  // likelihood for dC
+  w ~ dirichlet(a);
+  tp ~ normal(tp_prior_mean, tp_prior_sigma);
+  sigma_C ~ exponential(1.0);
+  sigma_N ~ exponential(1.0);
+}
+generated quantities {
+  vector[N_new] y_new;
+  //
+  for (n in 1:(N_new/2))
+    y_new[n] = normal_rng(x_new[n] * w + d[n]*tp, sigma_C);
+  //
+  for (n in (N_new/2+1):N)
+    y_new[n] = normal_rng(x_new[n] * w + d[n]*tp, sigma_N);  
+  
+}
+'
+  print(c(names(data_tp)[i], tp.prior.mean, tp.prior.sigma))
+  fit <- stan(model_code = mix_model_Code, data = dat, iter = 2000, chains = 4, control=list(adapt_delta=0.95))
+  print(fit, pars = c("w", 'tp', "sigma_C", "sigma_N"), probs = c(0.025, 0.25, 0.5, 0.75, 0.975))
+  print(plot(fit, pars = c("w", 'tp', "sigma_C", "sigma_N"), ci_level = 0.9, outer_level = 0.95))
+#
+  post <- extract(fit, permuted = TRUE)
+#--------------------------------------------------------------------------------
+# plot prior and posterior distribution
+  set.seed(123)
+  samples <- rdirichlet(1000, dat$a)
+
+# Convert samples to a data frame
+  prior_f_df <- as.data.frame(samples)
+  colnames(prior_f_df) <- c("f1", "f2", "f3")
+  prior_f_df <- gather(prior_f_df, key = "variable", value = "value")
+  prior_f_df$category <- 'Prior'
+#  
+  post_f_df  <- as.data.frame(post$w)
+  colnames(post_f_df) <- c("f1", "f2", "f3")
+  post_f_df <- gather(post_f_df, key = "variable", value = "value")
+  post_f_df$category <- 'Posterior'
+#
+  f_df <- rbind(prior_f_df, post_f_df)
+#  
+# plot prior and posterior pdf of f1, f2, f3
+p1 <-  ggplot(f_df, aes(x = value, color = variable, linetype=category)) +
+  geom_density() +
+  labs(x = "Value", y = "Density", color = "Parameters", linetype='Category') +
+  theme_minimal() +
+  scale_color_manual(values = c("f1" = "blue", "f2" = "red", "f3" = "green")) +
+  scale_linetype_manual(values = c("Posterior" = "solid", "Prior" = "dashed"))  +
+  theme(legend.position = c(0.85, 0.7))
+print(p1)
+#
+  prior_Tp_df <- data.frame(value=rnorm(1000, mean = tp.prior.mean, sd = tp.prior.sigma), category='Prior')
+  post_Tp_df  <- data.frame(value=post$tp, category='Posterior')
+  Tp_df <- rbind(prior_Tp_df, post_Tp_df)
+#  
+# plot prior and posterior pdf of Tp
+p2 <-  ggplot(Tp_df, aes(x = value, linetype=category)) +
+  geom_density() +
+  labs(x = "Value", y = "Density", linetype='Category') +
+  theme_minimal() +
+  scale_linetype_manual(values = c("Posterior" = "solid", "Prior" = "dashed"))  +
+  theme(legend.position = c(0.85, 0.7))
+print(p2)
+    
+# put results into output data frame
+  rows <- (4*(num-1)+1):(4*num)
+  res.basalfood[rows,1] <- names(data_tp)[i]                          # I cannot use res.basalfood$algae[rows] 
+  res.basalfood[rows,2] <- c('algae', 'C3plant', 'C4plant', 'tp')
+  res.basalfood[rows,3] <- apply(cbind(post$w, post$tp), 2, mean)
+  res.basalfood[rows,4] <- apply(cbind(post$w, post$tp), 2, quantile, 0.025)
+  res.basalfood[rows,5] <- apply(cbind(post$w, post$tp), 2, quantile, 0.975)
+
+# prediction  
+  mu <- post$y_new
+  mu.mean <- apply(mu, 2, mean)
+  mu.PI <- apply(mu, 2, function(x) quantile(x, probs = c(0.025, 0.975)))
+
+# observation vs prediction
+  print(cor.test(mu.mean, dat$y, method = "pearson"))
+  # RMSE of d13C
+  print(RMSE(mu.mean[1:length(mu.mean)/2], dat$y[1:length(mu.mean)/2]))
+  # RMSE of d15N
+  print(RMSE(mu.mean[(length(mu.mean)/2+1):length(mu.mean)], dat$y[(length(mu.mean)/2+1):length(mu.mean)]))
+
+  plot(mu.mean ~ dat$y, col="blue" , ylim=range(mu.PI) ,
+     xlab="Observed" , ylab="Predicted")
+  abline(a=0, b=1, lty = 2)
+  for (i in 1:nobsv) lines(rep(dat$y[i],2), mu.PI[,i], col="blue")
+}
+
+
+```
